@@ -15,7 +15,6 @@
  */
 package com.datastax.driver.core;
 
-import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
@@ -235,6 +234,27 @@ public class Metadata {
     }
 
     /**
+     * Returns a map from each token to the host that owns it (without taking replication into
+     * consideration).
+     *
+     * @return the token map.
+     */
+    public Map<Token, Host> getTokenMap() {
+        TokenMap current = tokenMap;
+        return (current == null) ? Collections.<Token, Host>emptyMap() : current.tokenToPrimary;
+    }
+
+    /**
+     * Returns the token ranges that define data distribution in the ring.
+     *
+     * @return the token ranges.
+     */
+    public Set<TokenRange> getTokenRanges() {
+        TokenMap current = tokenMap;
+        return (current == null) ? Collections.<TokenRange>emptySet() : current.tokenRanges;
+    }
+
+    /**
      * Returns the set of hosts that are replica for a given partition key.
      * <p>
      * Note that this method is a best effort method. Consumers should not rely
@@ -243,10 +263,7 @@ public class Metadata {
      * @param keyspace the name of the keyspace to get replicas for.
      * @param partitionKey the partition key for which to find the set of
      * replica.
-     * @return the (immutable) set of replicas for {@code partitionKey} as know
-     * by the driver. No strong guarantee is provided on the stalelessness of
-     * this information. It is also not guarantee that the returned set won't
-     * be empty (which is then some form of staleness).
+     * @return the (immutable) s3).
      */
     public Set<Host> getReplicas(String keyspace, ByteBuffer partitionKey) {
         keyspace = handleId(keyspace);
@@ -255,6 +272,24 @@ public class Metadata {
             return Collections.emptySet();
         } else {
             Set<Host> hosts = current.getReplicas(keyspace, current.factory.hash(partitionKey));
+            return hosts == null ? Collections.<Host>emptySet() : hosts;
+        }
+    }
+
+    /**
+     * Returns the set of hosts that are replica for a given token range.
+     *
+     * @param keyspace the name of the keyspace to get replicas for.
+     * @param range the token range.
+     * @return the (immutable) set of replicas for {@code range} as known by the driver.
+     */
+    public Set<Host> getReplicas(String keyspace, TokenRange range) {
+        keyspace = handleId(keyspace);
+        TokenMap current = tokenMap;
+        if (current == null) {
+            return Collections.emptySet();
+        } else {
+            Set<Host> hosts = current.getReplicas(keyspace, range.getEnd());
             return hosts == null ? Collections.<Host>emptySet() : hosts;
         }
     }
@@ -338,14 +373,18 @@ public class Metadata {
     static class TokenMap {
 
         private final Token.Factory factory;
+        private final Map<Token, Host> tokenToPrimary;
         private final Map<String, Map<Token, Set<Host>>> tokenToHosts;
         private final List<Token> ring;
+        private final Set<TokenRange> tokenRanges;
         final Set<Host> hosts;
 
-        private TokenMap(Token.Factory factory, Map<String, Map<Token, Set<Host>>> tokenToHosts, List<Token> ring, Set<Host> hosts) {
+        private TokenMap(Token.Factory factory, Map<Token, Host> tokenToPrimary, Map<String, Map<Token, Set<Host>>> tokenToHosts, List<Token> ring, Set<TokenRange> tokenRanges, Set<Host> hosts) {
             this.factory = factory;
+            this.tokenToPrimary = Collections.unmodifiableMap(tokenToPrimary);
             this.tokenToHosts = tokenToHosts;
             this.ring = ring;
+            this.tokenRanges = tokenRanges;
             this.hosts = hosts;
         }
 
@@ -369,18 +408,19 @@ public class Metadata {
             }
 
             List<Token> ring = new ArrayList<Token>(allSorted);
+            Set<TokenRange> tokenRanges = makeTokenRanges(ring, factory);
 
             Map<String, Map<Token, Set<Host>>> tokenToHosts = new HashMap<String, Map<Token, Set<Host>>>();
             for (KeyspaceMetadata keyspace : keyspaces)
             {
                 ReplicationStrategy strategy = keyspace.replicationStrategy();
-                if (strategy == null) {
-                    tokenToHosts.put(keyspace.getName(), makeNonReplicatedMap(tokenToPrimary));
-                } else {
-                    tokenToHosts.put(keyspace.getName(), strategy.computeTokenToReplicaMap(tokenToPrimary, ring));
-                }
+                Map<Token, Set<Host>> ksTokens = (strategy == null)
+                    ? makeNonReplicatedMap(tokenToPrimary)
+                    : strategy.computeTokenToReplicaMap(tokenToPrimary, ring);
+
+                tokenToHosts.put(keyspace.getName(), ksTokens);
             }
-            return new TokenMap(factory, tokenToHosts, ring, hosts);
+            return new TokenMap(factory, tokenToPrimary, tokenToHosts, ring, tokenRanges, hosts);
         }
 
         private Set<Host> getReplicas(String keyspace, Token token) {
@@ -405,6 +445,16 @@ public class Metadata {
             for (Map.Entry<Token, Host> entry : input.entrySet())
                 output.put(entry.getKey(), ImmutableSet.of(entry.getValue()));
             return output;
+        }
+
+        private static Set<TokenRange> makeTokenRanges(List<Token> ring, Token.Factory factory) {
+            ImmutableSet.Builder<TokenRange> builder = ImmutableSet.builder();
+            for (int i = 0; i < ring.size(); i++) {
+                Token start = ring.get(i);
+                Token end = ring.get((i + 1) % ring.size());
+                builder.add(new TokenRange(start, end, factory));
+            }
+            return builder.build();
         }
     }
 }

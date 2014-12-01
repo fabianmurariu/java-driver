@@ -5,6 +5,7 @@ CHANGELOG
 -------
 
 - [new feature] Add AddressTranslater for EC2 multi-region deployment (JAVA-518)
+- [improvement] Expose node token and range information (JAVA-312)
 
 2.0.9:
 ------

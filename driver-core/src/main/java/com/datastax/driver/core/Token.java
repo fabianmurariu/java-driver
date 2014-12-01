@@ -19,15 +19,33 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.List;
 
-/*
- * It's not an interface because we don't want to expose it
- * Note: we may want to expose this later if people use custom partitioner and want to be able to extend that.
- * This is way premature however.
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Lists;
+
+import com.datastax.driver.core.utils.Bytes;
+
+/**
+ * A token on the Cassandra ring.
  */
-abstract class Token implements Comparable<Token> {
+public abstract class Token implements Comparable<Token> {
 
-    public static Token.Factory getFactory(String partitionerName) {
+    /**
+     * Returns a serialized representation of this token, suitable to bind in a statement.
+     *
+     * @return the serialized representation.
+     */
+    public abstract ByteBuffer serialize();
+
+    /**
+     * Returns whether this token is the minimum token on the ring.
+     *
+     * @return whether this token is the minimum token on the ring
+     */
+    public abstract boolean isMinToken();
+
+    static Token.Factory getFactory(String partitionerName) {
         if (partitionerName.endsWith("Murmur3Partitioner"))
             return M3PToken.FACTORY;
         else if (partitionerName.endsWith("RandomPartitioner"))
@@ -38,14 +56,41 @@ abstract class Token implements Comparable<Token> {
             return null;
     }
 
-    public interface Factory {
-        public Token fromString(String tokenStr);
-        public Token hash(ByteBuffer partitionKey);
+    static abstract class Factory {
+        abstract Token fromString(String tokenStr);
+        abstract Token hash(ByteBuffer partitionKey);
+        abstract List<Token> split(Token startToken, Token endToken, int numberOfSplits);
+
+        // Base implementation for split
+        protected List<Token> split(BigInteger start, BigInteger range,
+                                    BigInteger ringEnd, BigInteger ringLength,
+                                    int numberOfSplits) {
+            BigInteger[] tmp = range.divideAndRemainder(BigInteger.valueOf(numberOfSplits));
+            BigInteger divider = tmp[0];
+            int remainder = tmp[1].intValue();
+
+            List<Token> results = Lists.newArrayListWithExpectedSize(numberOfSplits - 1);
+            BigInteger current = start;
+            BigInteger dividerPlusOne = (remainder == 0) ? null // won't be used
+                : divider.add(BigInteger.ONE);
+
+            for (int i = 1; i < numberOfSplits; i++) {
+                current = current.add(remainder-- > 0 ? dividerPlusOne : divider);
+                if (ringEnd != null && current.compareTo(ringEnd) > 0)
+                    current = current.subtract(ringLength);
+                results.add(newToken(current));
+            }
+            return results;
+        }
+        protected abstract Token newToken(BigInteger value);
     }
 
     // Murmur3Partitioner tokens
     static class M3PToken extends Token {
         private final long value;
+
+        private static final BigInteger RING_END = BigInteger.valueOf(Long.MAX_VALUE);
+        private static final BigInteger RING_LENGTH = RING_END.add(BigInteger.ONE).subtract(BigInteger.valueOf(Long.MIN_VALUE));
 
         public static final Factory FACTORY = new Factory() {
 
@@ -157,6 +202,28 @@ abstract class Token implements Comparable<Token> {
                 long v = murmur(partitionKey);
                 return new M3PToken(v == Long.MIN_VALUE ? Long.MAX_VALUE : v);
             }
+
+            @Override
+            List<Token> split(Token startToken, Token endToken, int numberOfSplits) {
+                if (startToken.compareTo(endToken) == 0)
+                    throw new IllegalArgumentException("Cannot split range with equal bounds");
+
+                BigInteger start = BigInteger.valueOf(((M3PToken)startToken).value);
+                BigInteger end = BigInteger.valueOf(((M3PToken)endToken).value);
+
+                BigInteger range = end.subtract(start);
+                if (range.compareTo(BigInteger.ZERO) < 0)
+                    range = range.add(RING_LENGTH);
+
+                return super.split(start, range,
+                    RING_END, RING_LENGTH,
+                    numberOfSplits);
+            }
+
+            @Override
+            protected Token newToken(BigInteger value) {
+                return new M3PToken(value.longValue());
+            }
         };
 
         private M3PToken(long value) {
@@ -184,10 +251,27 @@ abstract class Token implements Comparable<Token> {
         public int hashCode() {
             return (int)(value^(value>>>32));
         }
+
+        @Override
+        public ByteBuffer serialize() {
+            return DataType.bigint().serialize(value);
+        }
+
+        @Override
+        public boolean isMinToken() {
+            return value == Long.MIN_VALUE;
+        }
+
+        @Override
+        public String toString() {
+            return "M3PToken(" + value + ")";
+        }
     }
 
     // OPPartitioner tokens
     static class OPPToken extends Token {
+        private static final BigInteger TWO = BigInteger.valueOf(2);
+
         private final ByteBuffer value;
 
         public static final Factory FACTORY = new Factory() {
@@ -200,9 +284,79 @@ abstract class Token implements Comparable<Token> {
             public OPPToken hash(ByteBuffer partitionKey) {
                 return new OPPToken(partitionKey);
             }
+
+            @Override
+            public List<Token> split(Token startToken, Token endToken, int numberOfSplits) {
+                int tokenOrder = startToken.compareTo(endToken);
+                if (tokenOrder == 0)
+                    throw new IllegalArgumentException("Cannot split range with equal bounds");
+
+                OPPToken oppStartToken = (OPPToken)startToken;
+                OPPToken oppEndToken = (OPPToken)endToken;
+
+                int significantBytes;
+                BigInteger start, end, range, ringEnd, ringLength;
+                BigInteger bigNumberOfSplits = BigInteger.valueOf(numberOfSplits);
+                if (tokenOrder < 0) {
+                    // Since tokens are compared lexicographically, convert to integers using the largest length
+                    // (ex: given 0x0A and 0x0BCD, switch to 0x0A00 and 0x0BCD)
+                    significantBytes = Math.max(oppStartToken.value.capacity(), oppEndToken.value.capacity());
+
+                    // If the number of splits does not fit in the difference between the two integers, use more bytes
+                    // (ex: cannot fit 4 splits between 0x01 and 0x03, so switch to 0x0100 and 0x0300)
+                    // At most 4 additional bytes will be needed, since numberOfSplits is an integer.
+                    int addedBytes = 0;
+                    while (true) {
+                        start = toBigInteger(oppStartToken.value, significantBytes);
+                        end = toBigInteger(oppEndToken.value, significantBytes);
+                        range = end.subtract(start);
+                        if (addedBytes == 4 || range.compareTo(bigNumberOfSplits) >= 0)
+                            break;
+                        significantBytes += 1;
+                        addedBytes += 1;
+                    }
+                    ringEnd = ringLength = null; // won't be used
+                } else {
+                    // Same logic except that we wrap around the ring
+                    significantBytes = Math.max(oppStartToken.value.capacity(), oppEndToken.value.capacity());
+                    int addedBytes = 0;
+                    while (true) {
+                        start = toBigInteger(oppStartToken.value, significantBytes);
+                        end = toBigInteger(oppEndToken.value, significantBytes);
+                        ringEnd = TWO.pow(significantBytes * 8);
+                        ringLength = ringEnd.add(BigInteger.ONE);
+                        range = end.subtract(start).add(ringLength);
+                        if (addedBytes == 4 || range.compareTo(bigNumberOfSplits) >= 0)
+                            break;
+                        significantBytes += 1;
+                        addedBytes += 1;
+                    }
+                }
+
+                return super.split(start, range,
+                    ringEnd, ringLength,
+                    numberOfSplits);
+            }
+
+            @Override
+            protected Token newToken(BigInteger value) {
+                return new OPPToken(ByteBuffer.wrap(value.toByteArray()));
+            }
+
+            private BigInteger toBigInteger(ByteBuffer bb, int significantBytes) {
+                byte[] bytes = Bytes.getArray(bb);
+                byte[] target;
+                if (significantBytes != bytes.length) {
+                    target = new byte[significantBytes];
+                    System.arraycopy(bytes, 0, target, 0, bytes.length);
+                } else
+                    target = bytes;
+                return new BigInteger(1, target);
+            }
         };
 
-        private OPPToken(ByteBuffer value) {
+        @VisibleForTesting
+        OPPToken(ByteBuffer value) {
             this.value = value;
         }
 
@@ -226,12 +380,31 @@ abstract class Token implements Comparable<Token> {
         public int hashCode() {
             return value.hashCode();
         }
+
+        @Override
+        public ByteBuffer serialize() {
+            return value;
+        }
+
+        @Override
+        public boolean isMinToken() {
+            return value.capacity() == 0;
+        }
+
+        @Override
+        public String toString() {
+            return "OPPToken(" + Bytes.toHexString(value) + ")";
+        }
     }
 
     // RandomPartitioner tokens
     static class RPToken extends Token {
 
         private final BigInteger value;
+
+        private static final BigInteger MIN_VALUE = BigInteger.ONE.negate();
+        private static final BigInteger MAX_VALUE = BigInteger.valueOf(2).pow(127);
+        private static final BigInteger RING_LENGTH = MAX_VALUE.add(BigInteger.ONE);
 
         public static final Factory FACTORY = new Factory() {
 
@@ -253,6 +426,28 @@ abstract class Token implements Comparable<Token> {
             @Override
             public RPToken hash(ByteBuffer partitionKey) {
                 return new RPToken(md5(partitionKey));
+            }
+
+            @Override
+            List<Token> split(Token startToken, Token endToken, int numberOfSplits) {
+                if (startToken.compareTo(endToken) == 0)
+                    throw new IllegalArgumentException("Cannot split range with equal bounds");
+
+                BigInteger start = ((RPToken)startToken).value;
+                BigInteger end = ((RPToken)endToken).value;
+
+                BigInteger range = end.subtract(start);
+                if (range.compareTo(BigInteger.ZERO) < 0)
+                    range = range.add(RING_LENGTH);
+
+                return super.split(start, range,
+                    MAX_VALUE, RING_LENGTH,
+                    numberOfSplits);
+            }
+
+            @Override
+            protected Token newToken(BigInteger value) {
+                return new RPToken(value);
             }
         };
 
@@ -279,6 +474,21 @@ abstract class Token implements Comparable<Token> {
         @Override
         public int hashCode() {
             return value.hashCode();
+        }
+
+        @Override
+        public ByteBuffer serialize() {
+            return DataType.varint().serialize(value);
+        }
+
+        @Override
+        public boolean isMinToken() {
+            return value.equals(MIN_VALUE);
+        }
+
+        @Override
+        public String toString() {
+            return "RPToken(" + value + ")";
         }
     }
 }
