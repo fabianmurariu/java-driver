@@ -18,13 +18,13 @@ public class HeartbeatTest {
     @BeforeMethod(groups = "long")
     public void startCapturingLogs() {
         connectionLogger.setLevel(Level.DEBUG);
+        logs = new MemoryAppender();
         connectionLogger.addAppender(logs);
     }
 
     @AfterMethod(groups="long")
     public void stopCapturingLogs() {
         connectionLogger.setLevel(null);
-        logs = new MemoryAppender();
         connectionLogger.removeAppender(logs);
     }
 

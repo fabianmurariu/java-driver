@@ -58,7 +58,7 @@ public class PoolingOptions {
     private static final int DEFAULT_MAX_POOL_REMOTE = 2;
 
     private static final int DEFAULT_POOL_TIMEOUT_MILLIS = 5000;
-    private static final int DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 60;
+    private static final int DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30;
 
     private volatile Cluster.Manager manager;
 

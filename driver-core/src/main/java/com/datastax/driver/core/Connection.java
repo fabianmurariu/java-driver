@@ -748,7 +748,7 @@ class Connection {
 
         @Override
         public Message.Request request() {
-            return new Requests.Query("SELECT * FROM system.local");
+            return new Requests.Options();
         }
 
         @Override
@@ -759,7 +759,7 @@ class Connection {
         @Override
         public void onSet(Connection connection, Message.Response response, long latency, int retryCount) {
             switch (response.type) {
-                case RESULT:
+                case SUPPORTED:
                     logger.debug("{} heartbeat query succeeded", connection);
                     break;
                 default:
