@@ -52,8 +52,7 @@ public class HeartbeatTest {
             cluster.init();
 
             for (int i = 0; i < 5; i++) {
-                // Simulate activity
-                cluster.manager.controlConnection.refreshNodeInfo(TestUtils.findHost(cluster, 1));
+                triggerRequestOnControlConnection(cluster);
                 SECONDS.sleep(1);
             }
             assertThat(logs.getNext()).doesNotContain("sending heartbeat");
@@ -71,9 +70,9 @@ public class HeartbeatTest {
                 .contains("heartbeat query succeeded");
 
             // Ensure heartbeat is not sent after activity.
+            logs.getNext();
             for (int i = 0; i < 5; i++) {
-                // Simulate activity
-                cluster.manager.controlConnection.refreshNodeInfo(TestUtils.findHost(cluster, 1));
+                triggerRequestOnControlConnection(cluster);
                 SECONDS.sleep(1);
             }
             assertThat(logs.getNext()).doesNotContain("sending heartbeat");
@@ -95,7 +94,7 @@ public class HeartbeatTest {
      * Ensures that a heartbeat message is not sent if the configured heartbeat interval is 0.
      *
      * While difficult to prove the absence of evidence, the test will wait up to the default heartbeat interval
-     * (60 seconds + 1) and check to see if the heartbeat was sent.
+     * (30 seconds + 1) and check to see if the heartbeat was sent.
      *
      * @test_category connection:heartbeat
      * @expected_result heartbeat is not sent after default heartbeat interval (60) seconds of idle time.
@@ -117,14 +116,13 @@ public class HeartbeatTest {
             cluster.init();
 
             for (int i = 0; i < 5; i++) {
-                // Simulate activity
-                cluster.manager.controlConnection.refreshNodeInfo(TestUtils.findHost(cluster, 1));
+                triggerRequestOnControlConnection(cluster);
                 SECONDS.sleep(1);
             }
             assertThat(logs.get()).doesNotContain("sending heartbeat");
 
             // Sleep for a while and ensure no heartbeat is sent.
-            SECONDS.sleep(62);
+            SECONDS.sleep(32);
             assertThat(logs.get()).doesNotContain("sending heartbeat");
         } finally {
             if (cluster != null)
@@ -132,5 +130,10 @@ public class HeartbeatTest {
             if (ccm != null)
                 ccm.remove();
         }
+    }
+
+    // Simulates activity on the control connection via the internal API
+    private void triggerRequestOnControlConnection(Cluster cluster) {
+        cluster.manager.controlConnection.refreshNodeInfo(TestUtils.findHost(cluster, 1));
     }
 }
