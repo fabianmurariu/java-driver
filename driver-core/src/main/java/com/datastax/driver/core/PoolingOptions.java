@@ -281,6 +281,8 @@ public class PoolingOptions {
      * <p>
      * This is an application-level keep-alive, provided for convenience since adjusting the TCP keep-alive might not be
      * practical in all environments.
+     * <p>
+     * The default value for this option is 30 seconds.
      *
      * @param heartbeatIntervalSeconds the new value in seconds. If set to 0, it will disable the feature.
      * @return this {@code PoolingOptions}
